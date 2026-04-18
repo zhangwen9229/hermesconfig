@@ -1,0 +1,128 @@
+version: '3.8'
+
+services:
+  # 【1】数据库：强制初始化
+  db:
+    image: postgres:16-alpine
+    container_name: firecrawl-db
+    restart: always
+    environment:
+      - POSTGRES_USER=firecrawl
+      - POSTGRES_PASSWORD=firecrawl_pass
+      - POSTGRES_DB=firecrawl
+    command: >
+      sh -c "docker-entrypoint.sh postgres & 
+      until pg_isready -U firecrawl; do sleep 2; done;
+      psql -U firecrawl -d firecrawl -c 'CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\";' && 
+      psql -U firecrawl -d firecrawl -c 'CREATE SCHEMA IF NOT EXISTS nuq;' && 
+      wait"
+    volumes:
+      - firecrawl_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U firecrawl -d firecrawl"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # 【2】API 服务：合并迁移逻辑
+  firecrawl:
+    image: ghcr.io/firecrawl/firecrawl:latest
+    container_name: firecrawl-api
+    restart: always
+    environment:
+      - PORT=8080
+      - HOST=0.0.0.0
+      - SELF_HOSTED=true
+      - TYPE=api
+      # 显式指定所有 Redis 变体，防止内部组件回退到 127.0.0.1
+      - REDIS_URL=redis://redis:6379
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_RATE_LIMIT_URL=redis://redis:6379
+      - BULL_REDIS_URL=redis://redis:6379
+      - DATABASE_URL=postgresql://firecrawl:firecrawl_pass@db:5432/firecrawl
+      - NUQ_DATABASE_URL=postgresql://firecrawl:firecrawl_pass@db:5432/firecrawl
+      - NUQ_RABBITMQ_URL=amqp://guest:guest@mq:5672
+      - JWT_SECRET=shunge_2026_secret
+      - USE_DB_AUTHENTICATION=false
+      - PLAYWRIGHT_URL=ws://browserless:3000/chromium
+    ports:
+      - "8080:8080"
+    # 强制在启动 API 前运行迁移命令
+    command: sh -c "node dist/src/index.js --migrate-only && node dist/src/index.js"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mq:
+        condition: service_healthy
+      browserless:
+        condition: service_healthy
+
+  # 【3】Worker 服务：变量加固与延时
+  worker:
+    image: ghcr.io/firecrawl/firecrawl:latest
+    container_name: firecrawl-worker
+    restart: always
+    # 增加更长的 sleep，确保 API 的迁移彻底完成
+    entrypoint: [ "sh", "-c", "sleep 30 && node dist/src/services/queue-worker.js" ]
+    environment:
+      - TYPE=worker
+      - SELF_HOSTED=true
+      - REDIS_URL=redis://redis:6379
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_RATE_LIMIT_URL=redis://redis:6379
+      - BULL_REDIS_URL=redis://redis:6379
+      - DATABASE_URL=postgresql://firecrawl:firecrawl_pass@db:5432/firecrawl
+      - NUQ_DATABASE_URL=postgresql://firecrawl:firecrawl_pass@db:5432/firecrawl
+      - NUQ_RABBITMQ_URL=amqp://guest:guest@mq:5672
+      - PLAYWRIGHT_URL=ws://browserless:3000/chromium
+    depends_on:
+      firecrawl:
+        condition: service_started
+
+  # 【4】无头浏览器：极致压测资源限制
+  browserless:
+    image: browserless/chrome:latest
+    container_name: firecrawl-browserless
+    restart: always
+    environment:
+      - PORT=3000
+      - MAX_CONCURRENT_SESSIONS=2 # 👈 顺哥，再次降低并发到 2，确认是否是资源不足导致连接重置
+      - CONNECTION_TIMEOUT=60000
+      - MAX_REPLACE_FREE_RESOURCES=true
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # 【5】缓存
+  redis:
+    image: redis:7-alpine
+    container_name: firecrawl-redis
+    restart: always
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - firecrawl_redis_data:/data
+
+  # 【6】消息队列
+  mq:
+    image: rabbitmq:3-management-alpine
+    container_name: firecrawl-mq
+    restart: always
+    healthcheck:
+      test: ["CMD", "rabbitmqctl", "status"]
+      interval: 20s
+      timeout: 15s
+      retries: 5
+
+volumes:
+  firecrawl_db_data:
+  firecrawl_redis_data:
