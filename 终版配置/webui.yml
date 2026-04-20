@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  hermes-web:
+    image: ghcr.io/nesquena/hermes-webui:latest
+    container_name: hermes-web-ui
+    ports:
+      - "3001:8787"
+    environment:
+      - HERMES_WEBUI_HOST=0.0.0.0
+      - HERMES_WEBUI_PORT=8787
+      - REDIS_URL=redis://hermes-redis:6379/0
+      - HERMES_WEBUI_STATE_DIR=/home/hermeswebui/.hermes
+      # 👇 建议：设置一个登录密码，保护安全
+      - HERMES_WEBUI_PASSWORD=shunge_2026 
+      # 👇 解决 Agent 警告：将其指向状态目录下的 agent 文件夹
+      - HERMES_WEBUI_AGENT_DIR=/root/.hermes/agent
+      - HERMES_HOME=/root/.hermes
+    depends_on:
+      - hermes-redis
+    volumes:
+      - ./hermes_data:/home/hermeswebui/.hermes
+    restart: always
+
+  hermes-redis:
+    image: redis:6.2-alpine
+    container_name: hermes-redis
+    restart: always
+    volumes:
+      - hermes_redis_data:/data
+
+volumes:
+  hermes_redis_data:
