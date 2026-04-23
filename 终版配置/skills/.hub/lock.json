@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "installed": {
+    "find-skills": {
+      "source": "skills.sh",
+      "identifier": "skills-sh/vercel-labs/skills/find-skills",
+      "trust_level": "community",
+      "scan_verdict": "safe",
+      "content_hash": "sha256:1e85f6f9686e145a",
+      "install_path": "find-skills",
+      "files": [
+        "SKILL.md"
+      ],
+      "metadata": {},
+      "installed_at": "2026-04-21T17:29:14.763607+00:00",
+      "updated_at": "2026-04-21T17:29:14.763696+00:00"
+    }
+  }
+}

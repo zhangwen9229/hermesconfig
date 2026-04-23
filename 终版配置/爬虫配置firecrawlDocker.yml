@@ -99,6 +99,9 @@ services:
       - MAX_CONCURRENT_SESSIONS=2 # 👈 顺哥，再次降低并发到 2，确认是否是资源不足导致连接重置
       - CONNECTION_TIMEOUT=60000
       - MAX_REPLACE_FREE_RESOURCES=true
+      - ENABLE_XVFB=true        # 模拟图形界面，隐藏无头特征
+      - DEFAULT_BLOCK_ADS=true  # 屏蔽广告，避免检测
+      - DISABLE_BROWSER_CACHE=false
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:3000/"]
       interval: 10s

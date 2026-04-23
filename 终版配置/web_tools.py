@@ -47,6 +47,11 @@ import re
 import asyncio
 from typing import List, Dict, Any, Optional
 import httpx
+from dotenv import load_dotenv
+
+# 自动加载 .env 文件
+load_dotenv(os.path.expanduser("~/.hermes/.env"))
+
 from firecrawl import Firecrawl
 from agent.auxiliary_client import (
     async_call_llm,
@@ -65,6 +70,14 @@ from tools.website_policy import check_website_access
 
 logger = logging.getLogger(__name__)
 
+# 打印 Firecrawl 相关环境变量配置
+logger.info("[FIRECRAWL CONFIG] 环境变量加载检查:")
+logger.info("  FIRECRAWL_PRIMARY_URL: %s", os.getenv("FIRECRAWL_PRIMARY_URL", "NOT SET"))
+logger.info("  FIRECRAWL_SECONDARY_URL: %s", os.getenv("FIRECRAWL_SECONDARY_URL", "NOT SET"))
+logger.info("  FIRECRAWL_PRIMARY_API_KEY: %s", "SET" if os.getenv("FIRECRAWL_PRIMARY_API_KEY") else "NOT SET")
+logger.info("  FIRECRAWL_SECONDARY_API_KEY: %s", "SET" if os.getenv("FIRECRAWL_SECONDARY_API_KEY") else "NOT SET")
+logger.info("  FIRECRAWL_API_KEY: %s", "SET" if os.getenv("FIRECRAWL_API_KEY") else "NOT SET")
+
 
 # ─── Firecrawl Fallback ───────────────────────────────────────────────────────
 import json
@@ -76,7 +89,9 @@ BLOCKED_PATTERNS = [
     'captcha',
     '403 forbidden',
     'rate limit',
-    'too many requests'
+    'too many requests',
+    'document_antibot',
+    'scrape_retry_limit'
 ]
 
 _firecrawl_fallback_state = {
@@ -106,7 +121,12 @@ def _try_search_with_fallback(query, limit=10, **kwargs):
     primary_url = os.getenv("FIRECRAWL_PRIMARY_URL")
     api_key = os.getenv("FIRECRAWL_PRIMARY_API_KEY") or os.getenv("FIRECRAWL_API_KEY")
     
+    logger.debug("[FALLBACK] 搜索降级检查 - PRIMARY_URL: %s, API_KEY: %s", 
+                 primary_url[:20] if primary_url else None, 
+                 api_key[:10] if api_key else None)
+    
     if not primary_url:
+        logger.warning("[FALLBACK] 未配置 FIRECRAWL_PRIMARY_URL，降级逻辑不启用")
         return None
     
     # 检查是否需要切换（连续失败 > 60%）
@@ -116,13 +136,14 @@ def _try_search_with_fallback(query, limit=10, **kwargs):
         if failure_rate > 0.6:
             import time
             if time.time() - state['last_switch'] > state['cooldown']:
-                logger.warning("本地服务连续失败，切换到备用服务")
+                logger.warning("[FALLBACK] 本地服务连续失败率 %.0f%% > 60%，切换到备用服务", failure_rate * 100)
                 state['last_switch'] = time.time()
                 client = _get_fallback_firecrawl_client()
                 return client.search(query, limit=limit, **kwargs)
     
     # 尝试主服务
     try:
+        logger.info("[FALLBACK] 尝试主服务：%s", primary_url)
         client = Firecrawl(api_key=api_key, api_url=primary_url)
         result = client.search(query, limit=limit, **kwargs)
         
@@ -135,7 +156,7 @@ def _try_search_with_fallback(query, limit=10, **kwargs):
         # 关键：检查响应内容
         if _is_blocked_response(result):
             state['failures'].append(False)
-            logger.warning("本地服务响应被 block，尝试备用服务")
+            logger.warning("[FALLBACK] 主服务响应被 block，尝试备用服务")
             
             # 尝试备用服务
             backup_client = _get_fallback_firecrawl_client()
@@ -149,22 +170,85 @@ def _try_search_with_fallback(query, limit=10, **kwargs):
             
             if _is_blocked_response(backup_result):
                 state['failures'].append(False)
+                logger.error("[FALLBACK] 备用服务也被 block，抛出异常")
                 raise Exception("所有服务都被 block")
             
             state['failures'].append(True)
+            logger.info("[FALLBACK] ✅ 降级成功 - 使用备用服务")
             return backup_result
         
         state['failures'].append(True)
+        logger.debug("[FALLBACK] 主服务成功")
         return result
         
     except Exception as e:
         state['failures'].append(False)
-        logger.error(f"主服务失败：{e}")
+        error_msg = str(e).lower()
         
-        # 尝试备用服务
-        try:
+        # 检查是否是 blocked 相关的错误
+        blocked_keywords = ['blocked', 'anti-bot', 'captcha', 'duckduckgo', 'document_antibot', 'scrape_retry_limit']
+        if any(kw in error_msg for kw in blocked_keywords):
+            logger.warning("[FALLBACK] 检测到 blocked 错误 (%s)，尝试备用服务", error_msg[:100])
+            
+            # 尝试备用服务
+            try:
+                backup_client = _get_fallback_firecrawl_client()
+                backup_result = backup_client.search(query, limit=limit, **kwargs)
+                
+                # 转换 SearchData 对象为字典
+                if hasattr(backup_result, 'model_dump'):
+                    backup_result = backup_result.model_dump()
+                elif hasattr(backup_result, '__dict__'):
+                    backup_result = backup_result.__dict__
+                
+                logger.info("[FALLBACK] ✅ 降级成功 - 使用备用服务")
+                return backup_result
+            except Exception as backup_error:
+                logger.error("[FALLBACK] ❌ 备用服务也失败：%s", str(backup_error)[:100])
+                raise Exception(f"所有服务失败：{e}, {backup_error}")
+        
+        logger.error("[FALLBACK] 主服务失败（非 blocked 错误）：%s", str(e)[:100])
+        raise
+
+
+async def _try_scrape_with_fallback(url, formats=None, **kwargs):
+    """带降级逻辑的 scrape 操作"""
+    primary_url = os.getenv("FIRECRAWL_PRIMARY_URL")
+    api_key = os.getenv("FIRECRAWL_PRIMARY_API_KEY") or os.getenv("FIRECRAWL_API_KEY")
+    
+    logger.debug("[FALLBACK] 抓取降级检查 - PRIMARY_URL: %s, API_KEY: %s", 
+                 primary_url[:20] if primary_url else None, 
+                 api_key[:10] if api_key else None)
+    
+    if not primary_url:
+        logger.warning("[FALLBACK] 未配置 FIRECRAWL_PRIMARY_URL，降级逻辑不启用")
+        return None
+    
+    # 尝试主服务
+    try:
+        logger.info("[FALLBACK] 尝试主服务抓取：%s", primary_url)
+        client = Firecrawl(api_key=api_key, api_url=primary_url)
+        result = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: client.scrape(url=url, formats=formats, **kwargs)
+        )
+        
+        # 转换 SearchData 对象为字典
+        if hasattr(result, 'model_dump'):
+            result = result.model_dump()
+        elif hasattr(result, '__dict__'):
+            result = result.__dict__
+        
+        # 关键：检查响应内容
+        if _is_blocked_response(result):
+            logger.warning("[FALLBACK] 主服务抓取被 block，尝试备用服务")
+            
+            # 尝试备用服务
             backup_client = _get_fallback_firecrawl_client()
-            backup_result = backup_client.search(query, limit=limit, **kwargs)
+            backup_result = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: backup_client.scrape(url=url, formats=formats, **kwargs)
+            )
             
             # 转换 SearchData 对象为字典
             if hasattr(backup_result, 'model_dump'):
@@ -172,9 +256,46 @@ def _try_search_with_fallback(query, limit=10, **kwargs):
             elif hasattr(backup_result, '__dict__'):
                 backup_result = backup_result.__dict__
             
+            if _is_blocked_response(backup_result):
+                logger.error("[FALLBACK] 备用服务也被 block，抛出异常")
+                raise Exception("所有服务都被 block")
+            
+            logger.info("[FALLBACK] ✅ 降级成功 - 使用备用服务")
             return backup_result
-        except Exception as backup_error:
-            raise Exception(f"所有服务失败：{e}, {backup_error}")
+        
+        logger.debug("[FALLBACK] 主服务抓取成功")
+        return result
+        
+    except Exception as e:
+        error_msg = str(e).lower()
+        
+        # 检查是否是 blocked 相关的错误
+        blocked_keywords = ['blocked', 'anti-bot', 'captcha', 'duckduckgo', 'document_antibot', 'scrape_retry_limit']
+        if any(kw in error_msg for kw in blocked_keywords):
+            logger.warning("[FALLBACK] 检测到 blocked 错误 (%s)，尝试备用服务", error_msg[:100])
+            
+            # 尝试备用服务
+            try:
+                backup_client = _get_fallback_firecrawl_client()
+                backup_result = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: backup_client.scrape(url=url, formats=formats, **kwargs)
+                )
+                
+                # 转换 SearchData 对象为字典
+                if hasattr(backup_result, 'model_dump'):
+                    backup_result = backup_result.model_dump()
+                elif hasattr(backup_result, '__dict__'):
+                    backup_result = backup_result.__dict__
+                
+                logger.info("[FALLBACK] ✅ 降级成功 - 使用备用服务")
+                return backup_result
+            except Exception as backup_error:
+                logger.error("[FALLBACK] ❌ 备用服务也失败：%s", str(backup_error)[:100])
+                raise Exception(f"所有服务失败：{e}, {backup_error}")
+        
+        logger.error("[FALLBACK] 主服务抓取失败（非 blocked 错误）：%s", str(e)[:100])
+        raise
 
 
 # ─── Backend Selection ────────────────────────────────────────────────────────
@@ -411,7 +532,7 @@ def _tavily_request(endpoint: str, payload: dict) -> dict:
     payload["api_key"] = api_key
     url = f"{_TAVILY_BASE_URL}/{endpoint.lstrip('/')}"
     logger.info("Tavily %s request to %s", endpoint, url)
-    response = httpx.post(url, json=payload, timeout=60)
+    response = httpx.post(url, json=payload, timeout=300)
     response.raise_for_status()
     return response.json()
 
@@ -1389,6 +1510,7 @@ async def web_extract_tool(
                     formats = ["markdown", "html"]
 
                 # Always use individual scraping for simplicity and reliability
+                # Add fallback support for scrape operations
                 # Batch scraping adds complexity without much benefit for small numbers of URLs
                 results: List[Dict[str, Any]] = []
 
@@ -1411,24 +1533,42 @@ async def web_extract_tool(
 
                     try:
                         logger.info("Scraping: %s", url)
-                        # Run synchronous Firecrawl scrape in a thread with a
-                        # 60s timeout so a hung fetch doesn't block the session.
-                        try:
-                            scrape_result = await asyncio.wait_for(
-                                asyncio.to_thread(
-                                    _get_firecrawl_client().scrape,
-                                    url=url,
-                                    formats=formats,
-                                ),
-                                timeout=60,
-                            )
-                        except asyncio.TimeoutError:
-                            logger.warning("Firecrawl scrape timed out for %s", url)
-                            results.append({
-                                "url": url, "title": "", "content": "",
-                                "error": "Scrape timed out after 60s — page may be too large or unresponsive. Try browser_navigate instead.",
-                            })
-                            continue
+                        
+                        # 尝试主服务（本地 Firecrawl）
+                        primary_url = os.getenv("FIRECRAWL_PRIMARY_URL")
+                        if primary_url:
+                            # 使用带降级逻辑的 scrape
+                            scrape_result = await _try_scrape_with_fallback(url, formats=formats)
+                        else:
+                            # 直接调用默认客户端
+                            try:
+                                scrape_result = await asyncio.wait_for(
+                                    asyncio.to_thread(
+                                        _get_firecrawl_client().scrape,
+                                        url=url,
+                                        formats=formats,
+                                    ),
+                                    timeout=60,
+                                )
+                            except asyncio.TimeoutError:
+                                logger.warning("Firecrawl scrape timed out for %s", url)
+                                results.append({
+                                    "url": url, "title": "", "content": "",
+                                    "error": "Scrape timed out after 60s — page may be too large or unresponsive. Try browser_navigate instead.",
+                                })
+                                continue
+                        
+                        # 转换 SearchData 对象为字典
+                        if hasattr(scrape_result, 'model_dump'):
+                            scrape_result = scrape_result.model_dump()
+                        elif hasattr(scrape_result, '__dict__'):
+                            scrape_result = scrape_result.__dict__
+
+                        # 转换 SearchData 对象为字典
+                        if hasattr(scrape_result, 'model_dump'):
+                            scrape_result = scrape_result.model_dump()
+                        elif hasattr(scrape_result, '__dict__'):
+                            scrape_result = scrape_result.__dict__
 
                         scrape_payload = _extract_scrape_payload(scrape_result)
                         metadata = scrape_payload.get("metadata", {})
@@ -1455,7 +1595,7 @@ async def web_extract_tool(
                             logger.info("Blocked redirected web_extract for %s by rule %s", final_blocked["host"], final_blocked["rule"])
                             results.append({
                                 "url": final_url, "title": title, "content": "", "raw_content": "",
-                                "error": final_blocked["message"],
+
                                 "blocked_by_policy": {"host": final_blocked["host"], "rule": final_blocked["rule"], "source": final_blocked["source"]},
                             })
                             continue
