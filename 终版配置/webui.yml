@@ -1,25 +1,31 @@
+## 重要，需要更改hermes目录权限：sudo chown -R 1024:1024 /root/.hermes
+
 version: '3.8'
 
 services:
   hermes-web:
     image: ghcr.io/nesquena/hermes-webui:latest
     container_name: hermes-web-ui
+    # 修改 1：回归 root 身份，给脚本执行 sudo 的权限
+    user: "0:0"
     ports:
       - "3001:8787"
     environment:
+      # 修改 2：通过环境变量强制锁定脚本预期的 UID/GID，防止它自动检测失败
+      - WANTED_UID=0
+      - WANTED_GID=0
+      - HOME=/root
+      - HERMES_HOME=/root/.hermes
+      - HERMES_WEBUI_STATE_DIR=/root/.hermes
+      - HERMES_WEBUI_AGENT_DIR=/root/.hermes/agent
       - HERMES_WEBUI_HOST=0.0.0.0
       - HERMES_WEBUI_PORT=8787
+      - HERMES_WEBUI_PASSWORD=shunge_2026
       - REDIS_URL=redis://hermes-redis:6379/0
-      - HERMES_WEBUI_STATE_DIR=/home/hermeswebui/.hermes
-      # 👇 建议：设置一个登录密码，保护安全
-      - HERMES_WEBUI_PASSWORD=shunge_2026 
-      # 👇 解决 Agent 警告：将其指向状态目录下的 agent 文件夹
-      - HERMES_WEBUI_AGENT_DIR=/root/.hermes/agent
-      - HERMES_HOME=/root/.hermes
     depends_on:
       - hermes-redis
     volumes:
-      - ./hermes_data:/home/hermeswebui/.hermes
+      - /root/.hermes:/root/.hermes
     restart: always
 
   hermes-redis:

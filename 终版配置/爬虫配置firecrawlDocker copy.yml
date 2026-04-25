@@ -33,7 +33,7 @@ services:
       - PORT=8080
       - HOST=0.0.0.0
       - SELF_HOSTED=true
-      - TAVILY_API_KEY=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  # 👈 在这里填入你的 Key
+      - TAVILY_API_KEY=tvly-xxxxxxxGVVexvLZj3PrcPj1  # 👈 在这里填入你的 Key
       # 建议同时明确指定搜索提供商（部分版本需要）
       - SEARCH_PROVIDER=tavily
       - TYPE=api
@@ -73,7 +73,7 @@ services:
     environment:
       - TYPE=worker
       - SELF_HOSTED=true
-      - TAVILY_API_KEY=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  # 👈 在这里填入你的 Key
+      - TAVILY_API_KEY=tvly-xxxxxxxGVVexvLZj3PrcPj1  # 👈 在这里填入你的 Key
       # 建议同时明确指定搜索提供商（部分版本需要）
       - SEARCH_PROVIDER=tavily
       - REDIS_URL=redis://redis:6379

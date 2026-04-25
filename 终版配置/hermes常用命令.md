@@ -4,9 +4,8 @@ journalctl --user -u hermes-gateway -f  # View logs
 hermes --resume 20260419_120509_92ead7
 hermes -c "Fixing WeChat reply rules and dotenv parse error"
 
-Resume this session with:
-  hermes --resume 20260419_135254_dd5693
-  hermes -c "实现本地服务降级到官方服务"
+
+ hermes --resume 20260423_165405_6f4b68
 
    **备份完成**：
     - 原文件：`/root/.hermes/hermes-agent/tools/web_tools.py`
