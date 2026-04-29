@@ -82,12 +82,11 @@ import time
 FIRECRAWL_LOCAL_TIMEOUT = int(os.getenv("FIRECRAWL_LOCAL_TIMEOUT", "30"))  # 本地服务默认 30 秒
 FIRECRAWL_CLOUD_TIMEOUT = int(os.getenv("FIRECRAWL_CLOUD_TIMEOUT", "60"))   # 云服务默认 60 秒
 FIRECRAWL_ENABLE_FALLBACK = os.getenv("FIRECRAWL_ENABLE_FALLBACK", "true").lower() == "true"
-FIRECRAWL_LOG_PATH = "/root/.hermes/logs/firecrawl_extract.log"
-
-# 超时配置（可通过环境变量覆盖）
-FIRECRAWL_LOCAL_TIMEOUT = int(os.getenv("FIRECRAWL_LOCAL_TIMEOUT", "30"))  # 本地服务默认 30 秒
-FIRECRAWL_CLOUD_TIMEOUT = int(os.getenv("FIRECRAWL_CLOUD_TIMEOUT", "60"))   # 云服务默认 60 秒
-FIRECRAWL_ENABLE_FALLBACK = os.getenv("FIRECRAWL_ENABLE_FALLBACK", "true").lower() == "true"
+# 跨平台日志路径：默认 ~/.hermes/logs/firecrawl_extract.log，允许 FIRECRAWL_LOG_PATH 覆盖
+FIRECRAWL_LOG_PATH = os.getenv(
+    "FIRECRAWL_LOG_PATH",
+    os.path.join(os.path.expanduser("~"), ".hermes", "logs", "firecrawl_extract.log"),
+)
 
 BLOCKED_PATTERNS = [
     'blocked by anti-bot',
@@ -99,6 +98,49 @@ BLOCKED_PATTERNS = [
     'document_antibot',
     'scrape_retry_limit'
 ]
+
+# ── 搜索去重缓存（防止 Agent 层同词反复搜索导致死循环 / 资源浪费）──
+# key: (normalized_query, limit)  value: (timestamp, result_json, hit_count)
+import threading as _threading
+_WEB_SEARCH_CACHE: Dict[Any, Any] = {}
+_WEB_SEARCH_CACHE_LOCK = _threading.Lock()
+WEB_SEARCH_CACHE_TTL = int(os.getenv("WEB_SEARCH_CACHE_TTL", "300"))  # 秒
+WEB_SEARCH_CACHE_MAX = int(os.getenv("WEB_SEARCH_CACHE_MAX", "128"))
+
+
+def _normalize_search_key(query: str, limit: int):
+    return ((query or "").strip().lower(), int(limit))
+
+
+def _search_cache_get(query: str, limit: int):
+    key = _normalize_search_key(query, limit)
+    now = time.time()
+    with _WEB_SEARCH_CACHE_LOCK:
+        entry = _WEB_SEARCH_CACHE.get(key)
+        if entry is None:
+            return None
+        ts, payload, hits = entry
+        if now - ts > WEB_SEARCH_CACHE_TTL:
+            _WEB_SEARCH_CACHE.pop(key, None)
+            return None
+        _WEB_SEARCH_CACHE[key] = (ts, payload, hits + 1)
+        return payload, hits + 1
+
+
+def _search_cache_set(query: str, limit: int, payload: str):
+    key = _normalize_search_key(query, limit)
+    now = time.time()
+    with _WEB_SEARCH_CACHE_LOCK:
+        # evict oldest if over capacity
+        if len(_WEB_SEARCH_CACHE) >= WEB_SEARCH_CACHE_MAX:
+            # 简单 LRU：剔除最早 ts 的 1/4
+            victims = sorted(
+                _WEB_SEARCH_CACHE.items(), key=lambda kv: kv[1][0]
+            )[: max(1, WEB_SEARCH_CACHE_MAX // 4)]
+            for vk, _ in victims:
+                _WEB_SEARCH_CACHE.pop(vk, None)
+        _WEB_SEARCH_CACHE[key] = (now, payload, 0)
+
 
 _firecrawl_fallback_state = {
     'failures': deque(maxlen=10),
@@ -114,252 +156,339 @@ def _is_blocked_response(response):
     return any(pattern in response_str for pattern in BLOCKED_PATTERNS)
 
 def _get_fallback_firecrawl_client():
-    """获取备用 Firecrawl 客户端（官方云服务）"""
+    """获取备用 Firecrawl 客户端（官方云服务）。
+
+    缺少 API Key 时显式抛出 ValueError，避免 Firecrawl(api_key=None) 之后
+    出现的隐晦错误。调用方应捕获并写入 per-URL error。
+    """
     from firecrawl import Firecrawl
 
     backup_url = os.getenv("FIRECRAWL_SECONDARY_URL", "https://api.firecrawl.dev/v1")
     api_key = os.getenv("FIRECRAWL_SECONDARY_API_KEY") or os.getenv("FIRECRAWL_API_KEY")
 
+    if not api_key:
+        raise ValueError(
+            "FIRECRAWL_SECONDARY_API_KEY or FIRECRAWL_API_KEY required for cloud fallback"
+        )
+
     return Firecrawl(api_key=api_key, api_url=backup_url)
 
 def _log_fallback_event(event_type: str, detail: str = ""):
-    """记录降级事件到日志文件"""
-    os.makedirs(os.path.dirname(FIRECRAWL_LOG_PATH), exist_ok=True)
+    """记录降级/换源等关键事件到日志文件，并镜像输出到 logger。
+
+    任何写文件异常都被吞掉，绝不影响主流程。
+    """
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
     message = f"[{timestamp}] [{event_type}] {detail}"
     try:
+        os.makedirs(os.path.dirname(FIRECRAWL_LOG_PATH), exist_ok=True)
         with open(FIRECRAWL_LOG_PATH, "a", encoding="utf-8") as f:
             f.write(message + "\n")
     except Exception as e:
-        logger.error("Failed to write fallback log: %s", e)
+        logger.warning("Failed to write fallback log: %s", e)
     logger.info("%s", message)
 
+def _normalize_firecrawl_payload(value):
+    """将 Firecrawl SDK 返回的对象统一转为 dict。"""
+    if hasattr(value, 'model_dump'):
+        try:
+            return value.model_dump()
+        except Exception:
+            pass
+    if hasattr(value, '__dict__'):
+        try:
+            return {k: v for k, v in value.__dict__.items() if not k.startswith('_')}
+        except Exception:
+            pass
+    return value
+
+
+async def _run_firecrawl_call(callable_, timeout: int):
+    """统一的带超时调用：在线程池里跑同步 Firecrawl SDK。
+
+    使用 asyncio.to_thread + asyncio.wait_for，避免阻塞事件循环，
+    所有 fallback 路径共用此封装。
+    """
+    return await asyncio.wait_for(asyncio.to_thread(callable_), timeout=timeout)
+
+
+def _run_async_safely(coro):
+    """在同步上下文中安全执行协程。
+
+    - 若当前没有运行中的事件循环，使用 asyncio.run。
+    - 若当前已在事件循环里（被异步代码间接调用），用独立线程跑一个新 loop，
+      避免触发 'asyncio.run() cannot be called from a running event loop'。
+    """
+    try:
+        asyncio.get_running_loop()
+        running = True
+    except RuntimeError:
+        running = False
+
+    if not running:
+        return asyncio.run(coro)
+
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(asyncio.run, coro)
+        return future.result()
+
+
 async def _try_search_with_fallback(query, limit=10, **kwargs):
-    """带超时降级的搜索"""
+    """带超时降级的搜索（local primary -> cloud secondary）。
+
+    返回值：dict（搜索结果，已转 plain）。
+    异常：当主备服务全部失败/被 block 时抛出 Exception，由调用方处理。
+    特殊：当未配置 PRIMARY_URL 或显式禁用 fallback 时，抛 RuntimeError
+    让调用方走默认客户端分支（避免静默返回 None）。
+    """
     import time as _time
     primary_url = os.getenv("FIRECRAWL_PRIMARY_URL")
     api_key = os.getenv("FIRECRAWL_PRIMARY_API_KEY") or os.getenv("FIRECRAWL_API_KEY")
 
     logger.debug("[FALLBACK] 搜索降级检查 - PRIMARY_URL: %s, API_KEY: %s",
                  primary_url[:20] if primary_url else None,
-                 api_key[:10] if api_key else None)
+                 (api_key[:10] + "...") if api_key else None)
 
     if not primary_url or not FIRECRAWL_ENABLE_FALLBACK:
-        logger.warning("[FALLBACK] 降级逻辑未启用")
-        return None
+        logger.info("[FALLBACK] 降级逻辑未启用 (primary_url=%s, enable=%s)",
+                    bool(primary_url), FIRECRAWL_ENABLE_FALLBACK)
+        raise RuntimeError("firecrawl fallback disabled")
+
+    state = _firecrawl_fallback_state
 
     # 检查是否需要切换（连续失败 > 60%）
-    state = _firecrawl_fallback_state
     if len(state['failures']) >= 5:
         failure_rate = sum(1 for f in state['failures'] if not f) / len(state['failures'])
-        if failure_rate > 0.6:
-            if _time.time() - state['last_switch'] > state['cooldown']:
-                logger.warning("[FALLBACK] 本地服务连续失败率 %.0f%% > 60%%，切换到备用服务", failure_rate * 100)
-                state['last_switch'] = _time.time()
-                client = _get_fallback_firecrawl_client()
-                return client.search(query, limit=limit, **kwargs)
+        if failure_rate > 0.6 and _time.time() - state['last_switch'] > state['cooldown']:
+            logger.warning("[FALLBACK] 本地服务连续失败率 %.0f%% > 60%%，切换到备用服务",
+                           failure_rate * 100)
+            _log_fallback_event("FALLBACK_TRIGGERED",
+                                f"search:{query} reason=high_failure_rate ({failure_rate*100:.0f}%)")
+            state['last_switch'] = _time.time()
+            try:
+                backup_client = _get_fallback_firecrawl_client()
+                backup_result = await _run_firecrawl_call(
+                    lambda: backup_client.search(query, limit=limit, **kwargs),
+                    timeout=FIRECRAWL_CLOUD_TIMEOUT,
+                )
+                _log_fallback_event("CLOUD_SUCCESS", f"search:{query} via=high_failure_switch")
+                return _normalize_firecrawl_payload(backup_result)
+            except Exception as switch_err:
+                logger.error("[FALLBACK] 高失败率切换备用服务失败：%s", str(switch_err)[:200])
+                _log_fallback_event("CLOUD_FAIL",
+                                    f"search:{query} via=high_failure_switch err={str(switch_err)[:200]}")
+                raise
 
     # 尝试主服务（带超时检测）
     start_time = _time.time()
     try:
-        logger.info("[FALLBACK] 尝试主服务 (%ds 超时): %s", FIRECRAWL_LOCAL_TIMEOUT, primary_url)
+        logger.info("[FALLBACK] 尝试主服务搜索 (%ds 超时): %s query=%s",
+                    FIRECRAWL_LOCAL_TIMEOUT, primary_url, query)
         client = Firecrawl(api_key=api_key, api_url=primary_url)
-        
-        # 使用 asyncio 实现超时控制
-        loop = asyncio.get_event_loop()
-        result = await asyncio.wait_for(
-            loop.run_in_executor(None, lambda: client.search(query, limit=limit, **kwargs)),
-            timeout=FIRECRAWL_LOCAL_TIMEOUT
+        result = await _run_firecrawl_call(
+            lambda: client.search(query, limit=limit, **kwargs),
+            timeout=FIRECRAWL_LOCAL_TIMEOUT,
         )
-        
+
         elapsed = _time.time() - start_time
-        logger.info("[FALLBACK] 主服务成功 (%.2fs)", elapsed)
+        result = _normalize_firecrawl_payload(result)
 
-        # 转换 SearchData 对象为字典
-        if hasattr(result, 'model_dump'):
-            result = result.model_dump()
-        elif hasattr(result, '__dict__'):
-            result = result.__dict__
-
-        # 关键：检查响应内容
         if _is_blocked_response(result):
             state['failures'].append(False)
-            logger.warning("[FALLBACK] 主服务响应被 block，尝试备用服务")
+            logger.warning("[FALLBACK] 主服务响应被 block (%.2fs)，尝试备用服务", elapsed)
+            _log_fallback_event("FALLBACK_TRIGGERED",
+                                f"search:{query} reason=blocked elapsed={elapsed:.2f}s")
 
-            # 尝试备用服务
             backup_client = _get_fallback_firecrawl_client()
-            backup_result = backup_client.search(query, limit=limit, **kwargs)
-
-            # 转换 SearchData 对象为字典
-            if hasattr(backup_result, 'model_dump'):
-                backup_result = backup_result.model_dump()
-            elif hasattr(backup_result, '__dict__'):
-                backup_result = backup_result.__dict__
+            backup_result = await _run_firecrawl_call(
+                lambda: backup_client.search(query, limit=limit, **kwargs),
+                timeout=FIRECRAWL_CLOUD_TIMEOUT,
+            )
+            backup_result = _normalize_firecrawl_payload(backup_result)
 
             if _is_blocked_response(backup_result):
                 state['failures'].append(False)
-                logger.error("[FALLBACK] 备用服务也被 block，抛出异常")
+                logger.error("[FALLBACK] 备用服务也被 block")
+                _log_fallback_event("CLOUD_FAIL", f"search:{query} reason=blocked_on_cloud")
                 raise Exception("所有服务都被 block")
 
             state['failures'].append(True)
-            logger.info("[FALLBACK] ✅ 降级成功 - 使用备用服务")
+            _log_fallback_event("CLOUD_SUCCESS", f"search:{query} via=blocked_fallback")
             return backup_result
 
         state['failures'].append(True)
-        logger.debug("[FALLBACK] 主服务成功")
+        logger.info("[FALLBACK] 主服务搜索成功 (%.2fs)", elapsed)
         return result
 
     except asyncio.TimeoutError:
         elapsed = _time.time() - start_time
         state['failures'].append(False)
-        logger.warning("[FALLBACK] 主服务超时 (%.2fs > %ds)，切换到云服务", elapsed, FIRECRAWL_LOCAL_TIMEOUT)
-        _log_fallback_event("TIMEOUT_FALLBACK", f"search:{query}", f"Local timeout after {elapsed:.2f}s")
-        
-        # 切换到云服务
-        backup_client = _get_fallback_firecrawl_client()
-        backup_result = await asyncio.wait_for(
-            asyncio.get_event_loop().run_in_executor(None, lambda: backup_client.search(query, limit=limit, **kwargs)),
-            timeout=FIRECRAWL_CLOUD_TIMEOUT
-        )
-        logger.info("[FALLBACK] ✅ 云服务成功")
-        _log_fallback_event("CLOUD_SUCCESS", f"search:{query}", "Cloud fallback succeeded")
-        return backup_result
+        logger.warning("[FALLBACK] 主服务搜索超时 (%.2fs > %ds)，切换到云服务",
+                       elapsed, FIRECRAWL_LOCAL_TIMEOUT)
+        _log_fallback_event("PRIMARY_FAIL", f"search:{query} reason=timeout {elapsed:.2f}s")
+        _log_fallback_event("FALLBACK_TRIGGERED", f"search:{query} reason=timeout")
+
+        try:
+            backup_client = _get_fallback_firecrawl_client()
+            backup_result = await _run_firecrawl_call(
+                lambda: backup_client.search(query, limit=limit, **kwargs),
+                timeout=FIRECRAWL_CLOUD_TIMEOUT,
+            )
+            logger.info("[FALLBACK] 云服务搜索成功")
+            _log_fallback_event("CLOUD_SUCCESS", f"search:{query} via=timeout_fallback")
+            return _normalize_firecrawl_payload(backup_result)
+        except Exception as cloud_err:
+            logger.error("[FALLBACK] 云服务搜索也失败：%s", str(cloud_err)[:200])
+            _log_fallback_event("CLOUD_FAIL",
+                                f"search:{query} via=timeout_fallback err={str(cloud_err)[:200]}")
+            raise Exception(f"所有服务失败：local timeout, cloud {cloud_err}")
 
     except Exception as e:
         state['failures'].append(False)
+        elapsed = _time.time() - start_time
         error_msg = str(e).lower()
+        blocked_keywords = ['blocked', 'anti-bot', 'captcha', 'duckduckgo',
+                            'document_antibot', 'scrape_retry_limit']
+        is_blocked_err = any(kw in error_msg for kw in blocked_keywords)
+        _log_fallback_event(
+            "PRIMARY_FAIL",
+            f"search:{query} reason={'blocked' if is_blocked_err else 'exception'} "
+            f"elapsed={elapsed:.2f}s err={str(e)[:200]}",
+        )
 
-        # 检查是否是 blocked 相关的错误
-        blocked_keywords = ['blocked', 'anti-bot', 'captcha', 'duckduckgo', 'document_antibot', 'scrape_retry_limit']
-        if any(kw in error_msg for kw in blocked_keywords):
-            logger.warning("[FALLBACK] 检测到 blocked 错误 (%s)，尝试备用服务", error_msg[:100])
-
-            # 尝试备用服务
+        if is_blocked_err:
+            logger.warning("[FALLBACK] 检测到 blocked 错误，尝试备用服务: %s", str(e)[:200])
+            _log_fallback_event("FALLBACK_TRIGGERED", f"search:{query} reason=blocked_exception")
             try:
                 backup_client = _get_fallback_firecrawl_client()
-                backup_result = backup_client.search(query, limit=limit, **kwargs)
-
-                # 转换 SearchData 对象为字典
-                if hasattr(backup_result, 'model_dump'):
-                    backup_result = backup_result.model_dump()
-                elif hasattr(backup_result, '__dict__'):
-                    backup_result = backup_result.__dict__
-
-                logger.info("[FALLBACK] ✅ 降级成功 - 使用备用服务")
-                return backup_result
+                backup_result = await _run_firecrawl_call(
+                    lambda: backup_client.search(query, limit=limit, **kwargs),
+                    timeout=FIRECRAWL_CLOUD_TIMEOUT,
+                )
+                logger.info("[FALLBACK] 备用服务搜索成功")
+                _log_fallback_event("CLOUD_SUCCESS", f"search:{query} via=blocked_exception_fallback")
+                return _normalize_firecrawl_payload(backup_result)
             except Exception as backup_error:
-                logger.error("[FALLBACK] ❌ 备用服务也失败：%s", str(backup_error)[:100])
+                logger.error("[FALLBACK] 备用服务也失败：%s", str(backup_error)[:200])
+                _log_fallback_event("CLOUD_FAIL",
+                                    f"search:{query} err={str(backup_error)[:200]}")
                 raise Exception(f"所有服务失败：{e}, {backup_error}")
 
-        logger.error("[FALLBACK] 主服务失败（非 blocked 错误）：%s", str(e)[:100])
+        logger.error("[FALLBACK] 主服务失败（非 blocked 错误）：%s", str(e)[:200])
         raise
 
 
 async def _try_scrape_with_fallback(url, formats=None, **kwargs):
-    """带超时降级的 scrape 操作"""
+    """带超时降级的 scrape 操作（local primary -> cloud secondary）。
+
+    返回值：dict scrape 结果。
+    异常：主备失败时统一 raise，调用方负责捕获写入 per-URL error。
+    未配置 fallback 时抛 RuntimeError，让调用方走默认客户端分支。
+    """
     import time as _time
     primary_url = os.getenv("FIRECRAWL_PRIMARY_URL")
     api_key = os.getenv("FIRECRAWL_PRIMARY_API_KEY") or os.getenv("FIRECRAWL_API_KEY")
 
     logger.debug("[FALLBACK] 抓取降级检查 - PRIMARY_URL: %s, API_KEY: %s",
                  primary_url[:20] if primary_url else None,
-                 api_key[:10] if api_key else None)
+                 (api_key[:10] + "...") if api_key else None)
 
     if not primary_url or not FIRECRAWL_ENABLE_FALLBACK:
-        logger.warning("[FALLBACK] 降级逻辑未启用")
-        return None
+        logger.info("[FALLBACK] 降级逻辑未启用 (primary_url=%s, enable=%s)",
+                    bool(primary_url), FIRECRAWL_ENABLE_FALLBACK)
+        raise RuntimeError("firecrawl fallback disabled")
 
     start_time = _time.time()
-    # 尝试主服务（带超时检测）
     try:
-        logger.info("[FALLBACK] 尝试主服务抓取 (%ds 超时): %s", FIRECRAWL_LOCAL_TIMEOUT, primary_url)
+        logger.info("[FALLBACK] 尝试主服务抓取 (%ds 超时): url=%s",
+                    FIRECRAWL_LOCAL_TIMEOUT, url)
         client = Firecrawl(api_key=api_key, api_url=primary_url)
-        
-        result = await asyncio.wait_for(
-            asyncio.get_event_loop().run_in_executor(None, lambda: client.scrape(url=url, formats=formats, **kwargs)),
-            timeout=FIRECRAWL_LOCAL_TIMEOUT
+        result = await _run_firecrawl_call(
+            lambda: client.scrape(url=url, formats=formats, **kwargs),
+            timeout=FIRECRAWL_LOCAL_TIMEOUT,
         )
-        
+
         elapsed = _time.time() - start_time
-        logger.info("[FALLBACK] 主服务抓取成功 (%.2fs)", elapsed)
+        result = _normalize_firecrawl_payload(result)
 
-        # 转换 SearchData 对象为字典
-        if hasattr(result, 'model_dump'):
-            result = result.model_dump()
-        elif hasattr(result, '__dict__'):
-            result = result.__dict__
-
-        # 关键：检查响应内容
         if _is_blocked_response(result):
-            logger.warning("[FALLBACK] 主服务抓取被 block，尝试备用服务")
+            logger.warning("[FALLBACK] 主服务抓取被 block (%.2fs)，尝试备用服务", elapsed)
+            _log_fallback_event("PRIMARY_FAIL", f"scrape:{url} reason=blocked elapsed={elapsed:.2f}s")
+            _log_fallback_event("FALLBACK_TRIGGERED", f"scrape:{url} reason=blocked")
 
-            # 尝试备用服务
             backup_client = _get_fallback_firecrawl_client()
-            backup_result = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: backup_client.scrape(url=url, formats=formats, **kwargs)
+            backup_result = await _run_firecrawl_call(
+                lambda: backup_client.scrape(url=url, formats=formats, **kwargs),
+                timeout=FIRECRAWL_CLOUD_TIMEOUT,
             )
-
-            # 转换 SearchData 对象为字典
-            if hasattr(backup_result, 'model_dump'):
-                backup_result = backup_result.model_dump()
-            elif hasattr(backup_result, '__dict__'):
-                backup_result = backup_result.__dict__
+            backup_result = _normalize_firecrawl_payload(backup_result)
 
             if _is_blocked_response(backup_result):
-                logger.error("[FALLBACK] 备用服务也被 block，抛出异常")
+                logger.error("[FALLBACK] 备用服务也被 block: %s", url)
+                _log_fallback_event("CLOUD_FAIL", f"scrape:{url} reason=blocked_on_cloud")
                 raise Exception("所有服务都被 block")
 
-            logger.info("[FALLBACK] ✅ 降级成功 - 使用备用服务")
+            _log_fallback_event("CLOUD_SUCCESS", f"scrape:{url} via=blocked_fallback")
             return backup_result
 
-        logger.debug("[FALLBACK] 主服务抓取成功")
+        logger.info("[FALLBACK] 主服务抓取成功 (%.2fs) url=%s", elapsed, url)
         return result
 
     except asyncio.TimeoutError:
         elapsed = _time.time() - start_time
-        logger.warning("[FALLBACK] 主服务抓取超时 (%.2fs > %ds)，切换到云服务", elapsed, FIRECRAWL_LOCAL_TIMEOUT)
-        _log_fallback_event("TIMEOUT_FALLBACK", f"scrape:{url}", f"Local timeout after {elapsed:.2f}s")
-        
-        # 切换到云服务
-        backup_client = _get_fallback_firecrawl_client()
-        backup_result = await asyncio.wait_for(
-            asyncio.get_event_loop().run_in_executor(None, lambda: backup_client.scrape(url=url, formats=formats, **kwargs)),
-            timeout=FIRECRAWL_CLOUD_TIMEOUT
-        )
-        logger.info("[FALLBACK] ✅ 云服务抓取成功")
-        _log_fallback_event("CLOUD_SUCCESS", f"scrape:{url}", "Cloud fallback succeeded")
-        return backup_result
+        logger.warning("[FALLBACK] 主服务抓取超时 (%.2fs > %ds)，切换到云服务: %s",
+                       elapsed, FIRECRAWL_LOCAL_TIMEOUT, url)
+        _log_fallback_event("PRIMARY_FAIL", f"scrape:{url} reason=timeout {elapsed:.2f}s")
+        _log_fallback_event("FALLBACK_TRIGGERED", f"scrape:{url} reason=timeout")
+
+        try:
+            backup_client = _get_fallback_firecrawl_client()
+            backup_result = await _run_firecrawl_call(
+                lambda: backup_client.scrape(url=url, formats=formats, **kwargs),
+                timeout=FIRECRAWL_CLOUD_TIMEOUT,
+            )
+            logger.info("[FALLBACK] 云服务抓取成功: %s", url)
+            _log_fallback_event("CLOUD_SUCCESS", f"scrape:{url} via=timeout_fallback")
+            return _normalize_firecrawl_payload(backup_result)
+        except Exception as cloud_err:
+            logger.error("[FALLBACK] 云服务抓取也失败 url=%s err=%s", url, str(cloud_err)[:200])
+            _log_fallback_event("CLOUD_FAIL",
+                                f"scrape:{url} via=timeout_fallback err={str(cloud_err)[:200]}")
+            raise Exception(f"所有服务失败：local timeout, cloud {cloud_err}")
 
     except Exception as e:
+        elapsed = _time.time() - start_time
         error_msg = str(e).lower()
+        blocked_keywords = ['blocked', 'anti-bot', 'captcha', 'duckduckgo',
+                            'document_antibot', 'scrape_retry_limit']
+        is_blocked_err = any(kw in error_msg for kw in blocked_keywords)
+        _log_fallback_event(
+            "PRIMARY_FAIL",
+            f"scrape:{url} reason={'blocked' if is_blocked_err else 'exception'} "
+            f"elapsed={elapsed:.2f}s err={str(e)[:200]}",
+        )
 
-        # 检查是否是 blocked 相关的错误
-        blocked_keywords = ['blocked', 'anti-bot', 'captcha', 'duckduckgo', 'document_antibot', 'scrape_retry_limit']
-        if any(kw in error_msg for kw in blocked_keywords):
-            logger.warning("[FALLBACK] 检测到 blocked 错误 (%s)，尝试备用服务", error_msg[:100])
-
-            # 尝试备用服务
+        if is_blocked_err:
+            logger.warning("[FALLBACK] 检测到 blocked 错误，尝试备用服务: %s", str(e)[:200])
+            _log_fallback_event("FALLBACK_TRIGGERED", f"scrape:{url} reason=blocked_exception")
             try:
                 backup_client = _get_fallback_firecrawl_client()
-                backup_result = await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    lambda: backup_client.scrape(url=url, formats=formats, **kwargs)
+                backup_result = await _run_firecrawl_call(
+                    lambda: backup_client.scrape(url=url, formats=formats, **kwargs),
+                    timeout=FIRECRAWL_CLOUD_TIMEOUT,
                 )
-
-                # 转换 SearchData 对象为字典
-                if hasattr(backup_result, 'model_dump'):
-                    backup_result = backup_result.model_dump()
-                elif hasattr(backup_result, '__dict__'):
-                    backup_result = backup_result.__dict__
-
-                logger.info("[FALLBACK] ✅ 降级成功 - 使用备用服务")
-                return backup_result
+                logger.info("[FALLBACK] 备用服务抓取成功: %s", url)
+                _log_fallback_event("CLOUD_SUCCESS", f"scrape:{url} via=blocked_exception_fallback")
+                return _normalize_firecrawl_payload(backup_result)
             except Exception as backup_error:
-                logger.error("[FALLBACK] ❌ 备用服务也失败：%s", str(backup_error)[:100])
+                logger.error("[FALLBACK] 备用服务也失败 url=%s err=%s",
+                             url, str(backup_error)[:200])
+                _log_fallback_event("CLOUD_FAIL", f"scrape:{url} err={str(backup_error)[:200]}")
                 raise Exception(f"所有服务失败：{e}, {backup_error}")
 
-        logger.error("[FALLBACK] 主服务抓取失败（非 blocked 错误）：%s", str(e)[:100])
+        logger.error("[FALLBACK] 主服务抓取失败（非 blocked 错误）url=%s err=%s",
+                     url, str(e)[:200])
         raise
 
 
@@ -1379,6 +1508,40 @@ def web_search_tool(query: str, limit: int = 5) -> str:
         if is_interrupted():
             return tool_error("Interrupted", success=False)
 
+        # ── 去重缓存：同 query+limit 在 TTL 内命中直接返回 ──
+        # 用于防止 Agent 层同词反复调用 search 造成死循环/资源浪费。
+        cached = _search_cache_get(query, limit)
+        if cached is not None:
+            cached_payload, hit_count = cached
+            logger.warning(
+                "[WEB_SEARCH] duplicate query detected (hit=%d, ttl=%ds): %r — returning cached result",
+                hit_count, WEB_SEARCH_CACHE_TTL, query,
+            )
+            _log_fallback_event(
+                "SEARCH_CACHE_HIT",
+                f"query={query!r} limit={limit} hit_count={hit_count}",
+            )
+            try:
+                cached_obj = json.loads(cached_payload)
+                if isinstance(cached_obj, dict):
+                    note = (
+                        f"duplicate query within {WEB_SEARCH_CACHE_TTL}s TTL; "
+                        f"returned cached result (hit_count={hit_count}). "
+                        "Stop re-issuing the same query — switch synonyms or use web_extract."
+                    )
+                    cached_obj["note"] = note
+                    cached_obj["cache_hit"] = True
+                    cached_obj["cache_hit_count"] = hit_count
+                    cached_payload = json.dumps(cached_obj, indent=2, ensure_ascii=False)
+            except Exception:
+                pass
+            debug_call_data["cache_hit"] = True
+            debug_call_data["cache_hit_count"] = hit_count
+            debug_call_data["final_response_size"] = len(cached_payload)
+            _debug.log_call("web_search_tool", debug_call_data)
+            _debug.save()
+            return cached_payload
+
         # Dispatch to the configured backend
         backend = _get_backend()
         if backend == "parallel":
@@ -1388,6 +1551,7 @@ def web_search_tool(query: str, limit: int = 5) -> str:
             debug_call_data["final_response_size"] = len(result_json)
             _debug.log_call("web_search_tool", debug_call_data)
             _debug.save()
+            _search_cache_set(query, limit, result_json)
             return result_json
 
         if backend == "exa":
@@ -1397,6 +1561,7 @@ def web_search_tool(query: str, limit: int = 5) -> str:
             debug_call_data["final_response_size"] = len(result_json)
             _debug.log_call("web_search_tool", debug_call_data)
             _debug.save()
+            _search_cache_set(query, limit, result_json)
             return result_json
 
         if backend == "tavily":
@@ -1413,17 +1578,34 @@ def web_search_tool(query: str, limit: int = 5) -> str:
             debug_call_data["final_response_size"] = len(result_json)
             _debug.log_call("web_search_tool", debug_call_data)
             _debug.save()
+            _search_cache_set(query, limit, result_json)
             return result_json
 
-        logger.info("Searching the web for: '%s' (limit: %d)", query, limit)
+        logger.info("[WEB_SEARCH] 开始搜索: '%s' (limit=%d)", query, limit)
 
         # 检查是否配置了本地服务（用于降级）
         primary_url = os.getenv("FIRECRAWL_PRIMARY_URL")
-        if primary_url:
-            # 使用带降级逻辑的搜索（异步函数，需要同步包装）
-            response = asyncio.run(_try_search_with_fallback(query, limit=limit))
-        else:
+        response = None
+        if primary_url and FIRECRAWL_ENABLE_FALLBACK:
+            # 使用带降级逻辑的搜索（异步函数，安全包装为同步）
+            try:
+                response = _run_async_safely(_try_search_with_fallback(query, limit=limit))
+            except RuntimeError as fallback_disabled:
+                # fallback 自检后判定不可用 —— 走默认客户端分支
+                logger.info("[WEB_SEARCH] fallback 路径不可用，回退默认客户端: %s",
+                            fallback_disabled)
+                response = None
+            except Exception as fallback_err:
+                # 主备都失败：返回错误给上游，由上游决定是否换源
+                logger.error("[WEB_SEARCH] firecrawl 主备搜索均失败: %s",
+                             str(fallback_err)[:300])
+                _log_fallback_event("SEARCH_EXHAUSTED",
+                                    f"query={query} err={str(fallback_err)[:200]}")
+                raise
+
+        if response is None:
             # 直接调用默认客户端
+            logger.info("[WEB_SEARCH] 使用默认 Firecrawl 客户端搜索")
             response = _get_firecrawl_client().search(
                 query=query,
                 limit=limit
@@ -1458,12 +1640,15 @@ def web_search_tool(query: str, limit: int = 5) -> str:
         # Log debug information
         _debug.log_call("web_search_tool", debug_call_data)
         _debug.save()
-        
+
+        # 写入去重缓存（成功路径）
+        _search_cache_set(query, limit, result_json)
+
         return result_json
-        
+
     except Exception as e:
         error_msg = f"Error searching web: {str(e)}"
-        logger.debug("%s", error_msg)
+        logger.error("[WEB_SEARCH] %s", error_msg)
 
         debug_call_data["error"] = error_msg
         _debug.log_call("web_search_tool", debug_call_data)
@@ -1477,7 +1662,9 @@ async def web_extract_tool(
     format: str = None,
     use_llm_processing: bool = True,
     model: Optional[str] = None,
-    min_length: int = DEFAULT_MIN_LENGTH_FOR_SUMMARIZATION
+    min_length: int = DEFAULT_MIN_LENGTH_FOR_SUMMARIZATION,
+    query: Optional[str] = None,
+    max_search_retries: int = 5,
 ) -> str:
     """
     Extract content from specific web pages using available extraction API backend.
@@ -1491,12 +1678,15 @@ async def web_extract_tool(
         use_llm_processing (bool): Whether to process content with LLM for summarization (default: True)
         model (Optional[str]): The model to use for LLM processing (defaults to current auxiliary backend model)
         min_length (int): Minimum content length to trigger LLM processing (default: 5000)
+        query (Optional[str]): 原始检索关键词。当传入的 URL 全部抓取失败时，用他调用 web_search 拉取新候选重试。
+        max_search_retries (int): 换源重试时最多尝试的新链接数（默认 5）。
 
     Security: URLs are checked for embedded secrets before fetching.
     
     Returns:
         str: JSON string containing extracted content. If LLM processing is enabled and successful,
              the 'content' field will contain the processed markdown summary instead of raw content.
+             全部失败时返回保留 per-URL error 的结构，由上游判断是否重试。
     
     Raises:
         Exception: If extraction fails or API key is not set
@@ -1519,7 +1709,9 @@ async def web_extract_tool(
             "format": format,
             "use_llm_processing": use_llm_processing,
             "model": model,
-            "min_length": min_length
+            "min_length": min_length,
+            "query": query,
+            "max_search_retries": max_search_retries,
         },
         "error": None,
         "pages_extracted": 0,
@@ -1527,11 +1719,15 @@ async def web_extract_tool(
         "original_response_size": 0,
         "final_response_size": 0,
         "compression_metrics": [],
-        "processing_applied": []
+        "processing_applied": [],
+        "replacement_attempts": 0,
+        "replacement_succeeded": False,
+        "replacement_urls_tried": [],
     }
     
     try:
-        logger.info("Extracting content from %d URL(s)", len(urls))
+        logger.info("[WEB_EXTRACT] 开始抽取 urls=%d format=%s query=%s max_search_retries=%d",
+                    len(urls), format, query, max_search_retries)
 
         # ── SSRF protection — filter out private/internal URLs before any backend ──
         safe_urls = []
@@ -1545,6 +1741,119 @@ async def web_extract_tool(
             else:
                 safe_urls.append(url)
 
+        # Determine Firecrawl formats once (used by main loop and replacement loop)
+        if format == "markdown":
+            firecrawl_formats: List[str] = ["markdown"]
+        elif format == "html":
+            firecrawl_formats = ["html"]
+        else:
+            firecrawl_formats = ["markdown", "html"]
+
+        async def _scrape_one_firecrawl(target_url: str) -> Dict[str, Any]:
+            """对单个 URL 执行 Firecrawl 抓取（包括主备降级、超时保护、policy 检查）。
+
+            返回统一的 result dict，包含 url/title/content/raw_content/metadata 或 error 字段。
+            不向外抛出异常，以便上层判断成败。
+            """
+            from tools.interrupt import is_interrupted as _is_interrupted
+            if _is_interrupted():
+                return {"url": target_url, "title": "", "content": "", "error": "Interrupted"}
+
+            blocked_pre = check_website_access(target_url)
+            if blocked_pre:
+                logger.info("[WEB_EXTRACT] policy blocked url=%s rule=%s",
+                            blocked_pre["host"], blocked_pre["rule"])
+                return {
+                    "url": target_url, "title": "", "content": "",
+                    "error": blocked_pre["message"],
+                    "blocked_by_policy": {
+                        "host": blocked_pre["host"], "rule": blocked_pre["rule"],
+                        "source": blocked_pre["source"],
+                    },
+                }
+
+            logger.info("[WEB_EXTRACT] scraping url=%s attempt=primary", target_url)
+            primary_url_env = os.getenv("FIRECRAWL_PRIMARY_URL")
+            scrape_result = None
+            try:
+                if primary_url_env and FIRECRAWL_ENABLE_FALLBACK:
+                    try:
+                        scrape_result = await _try_scrape_with_fallback(
+                            target_url, formats=firecrawl_formats
+                        )
+                    except RuntimeError:
+                        # fallback 未启用——走默认客户端
+                        scrape_result = None
+
+                if scrape_result is None:
+                    try:
+                        scrape_result = await asyncio.wait_for(
+                            asyncio.to_thread(
+                                _get_firecrawl_client().scrape,
+                                url=target_url,
+                                formats=firecrawl_formats,
+                            ),
+                            timeout=FIRECRAWL_LOCAL_TIMEOUT,
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning("[WEB_EXTRACT] default firecrawl scrape 超时 url=%s",
+                                       target_url)
+                        return {
+                            "url": target_url, "title": "", "content": "",
+                            "error": (
+                                f"Scrape timed out after {FIRECRAWL_LOCAL_TIMEOUT}s"
+                                " — page may be too large or unresponsive."
+                            ),
+                        }
+            except Exception as scrape_err:
+                logger.warning("[WEB_EXTRACT] scrape 失败 url=%s err=%s",
+                               target_url, str(scrape_err)[:200])
+                return {
+                    "url": target_url, "title": "", "content": "", "raw_content": "",
+                    "error": str(scrape_err),
+                }
+
+            scrape_result = _normalize_firecrawl_payload(scrape_result)
+            scrape_payload = _extract_scrape_payload(scrape_result)
+            metadata = scrape_payload.get("metadata", {})
+            content_markdown = scrape_payload.get("markdown")
+            content_html = scrape_payload.get("html")
+
+            if not isinstance(metadata, dict):
+                metadata = _normalize_firecrawl_payload(metadata) or {}
+                if not isinstance(metadata, dict):
+                    metadata = {}
+
+            title_meta = metadata.get("title", "")
+            final_url = metadata.get("sourceURL", target_url)
+
+            final_blocked = check_website_access(final_url)
+            if final_blocked:
+                logger.info("[WEB_EXTRACT] policy blocked redirect url=%s rule=%s",
+                            final_blocked["host"], final_blocked["rule"])
+                return {
+                    "url": final_url, "title": title_meta, "content": "", "raw_content": "",
+                    "error": final_blocked["message"],
+                    "blocked_by_policy": {
+                        "host": final_blocked["host"], "rule": final_blocked["rule"],
+                        "source": final_blocked["source"],
+                    },
+                }
+
+            chosen_content = (
+                content_markdown
+                if (format == "markdown" or (format is None and content_markdown))
+                else content_html or content_markdown or ""
+            )
+
+            return {
+                "url": final_url,
+                "title": title_meta,
+                "content": chosen_content,
+                "raw_content": chosen_content,
+                "metadata": metadata,
+            }
+
         # Dispatch only safe URLs to the configured backend
         if not safe_urls:
             results = []
@@ -1556,139 +1865,161 @@ async def web_extract_tool(
             elif backend == "exa":
                 results = _exa_extract(safe_urls)
             elif backend == "tavily":
-                logger.info("Tavily extract: %d URL(s)", len(safe_urls))
+                logger.info("[WEB_EXTRACT] Tavily extract %d URL(s)", len(safe_urls))
                 raw = _tavily_request("extract", {
                     "urls": safe_urls,
                     "include_images": False,
                 })
                 results = _normalize_tavily_documents(raw, fallback_url=safe_urls[0] if safe_urls else "")
             else:
-                # ── Firecrawl extraction ──
-                # Determine requested formats for Firecrawl v2
-                formats: List[str] = []
-                if format == "markdown":
-                    formats = ["markdown"]
-                elif format == "html":
-                    formats = ["html"]
-                else:
-                    # Default: request markdown for LLM-readiness and include html as backup
-                    formats = ["markdown", "html"]
-
-                # Always use individual scraping for simplicity and reliability
-                # Batch scraping adds complexity without much benefit for small numbers of URLs
+                # ── Firecrawl extraction (per-URL via _scrape_one_firecrawl) ──
                 results: List[Dict[str, Any]] = []
-
-                from tools.interrupt import is_interrupted as _is_interrupted
                 for url in safe_urls:
-                    if _is_interrupted():
-                        results.append({"url": url, "error": "Interrupted", "title": ""})
-                        continue
-
-                    # Website policy check — block before fetching
-                    blocked = check_website_access(url)
-                    if blocked:
-                        logger.info("Blocked web_extract for %s by rule %s", blocked["host"], blocked["rule"])
-                        results.append({
-                            "url": url, "title": "", "content": "",
-                            "error": blocked["message"],
-                            "blocked_by_policy": {"host": blocked["host"], "rule": blocked["rule"], "source": blocked["source"]},
-                        })
-                        continue
-
-                    try:
-                        logger.info("Scraping: %s", url)
-
-                        # 尝试主服务（本地 Firecrawl）
-                        primary_url = os.getenv("FIRECRAWL_PRIMARY_URL")
-                        if primary_url:
-                            # 使用带降级逻辑的 scrape
-                            scrape_result = await _try_scrape_with_fallback(url, formats=formats)
-                        else:
-                            # 直接调用默认客户端
-                            # Run synchronous Firecrawl scrape in a thread with a
-                            # 60s timeout so a hung fetch doesn't block the session.
-                            try:
-                                scrape_result = await asyncio.wait_for(
-                                    asyncio.to_thread(
-                                        _get_firecrawl_client().scrape,
-                                        url=url,
-                                        formats=formats,
-                                    ),
-                                    timeout=60,
-                                )
-                            except asyncio.TimeoutError:
-                                logger.warning("Firecrawl scrape timed out for %s", url)
-                                results.append({
-                                    "url": url, "title": "", "content": "",
-                                    "error": "Scrape timed out after 60s — page may be too large or unresponsive. Try browser_navigate instead.",
-                                })
-                                continue
-
-                        # 转换 SearchData 对象为字典
-                        if hasattr(scrape_result, 'model_dump'):
-                            scrape_result = scrape_result.model_dump()
-                        elif hasattr(scrape_result, '__dict__'):
-                            scrape_result = scrape_result.__dict__
-
-                        scrape_payload = _extract_scrape_payload(scrape_result)
-                        metadata = scrape_payload.get("metadata", {})
-                        title = ""
-                        content_markdown = scrape_payload.get("markdown")
-                        content_html = scrape_payload.get("html")
-
-                        # Ensure metadata is a dict (not an object)
-                        if not isinstance(metadata, dict):
-                            if hasattr(metadata, 'model_dump'):
-                                metadata = metadata.model_dump()
-                            elif hasattr(metadata, '__dict__'):
-                                metadata = metadata.__dict__
-                            else:
-                                metadata = {}
-
-                        # Get title from metadata
-                        title = metadata.get("title", "")
-
-                        # Re-check final URL after redirect
-                        final_url = metadata.get("sourceURL", url)
-                        final_blocked = check_website_access(final_url)
-                        if final_blocked:
-                            logger.info("Blocked redirected web_extract for %s by rule %s", final_blocked["host"], final_blocked["rule"])
-                            results.append({
-                                "url": final_url, "title": title, "content": "", "raw_content": "",
-                                "error": final_blocked["message"],
-                                "blocked_by_policy": {"host": final_blocked["host"], "rule": final_blocked["rule"], "source": final_blocked["source"]},
-                            })
-                            continue
-
-                        # Choose content based on requested format
-                        chosen_content = content_markdown if (format == "markdown" or (format is None and content_markdown)) else content_html or content_markdown or ""
-
-                        results.append({
-                            "url": final_url,
-                            "title": title,
-                            "content": chosen_content,
-                            "raw_content": chosen_content,
-                            "metadata": metadata  # Now guaranteed to be a dict
-                        })
-
-                    except Exception as scrape_err:
-                        logger.debug("Scrape failed for %s: %s", url, scrape_err)
-                        results.append({
-                            "url": url,
-                            "title": "",
-                            "content": "",
-                            "raw_content": "",
-                            "error": str(scrape_err)
-                        })
+                    results.append(await _scrape_one_firecrawl(url))
 
         # Merge any SSRF-blocked results back in
         if ssrf_blocked:
             results = ssrf_blocked + results
 
+        # ── 换源重试：全部失败且提供了 query 时，用 web_search 拉取新候选 ──
+        backend_for_replacement = _get_backend()
+        replacement_used = False
+        if (
+            query
+            and max_search_retries > 0
+            and backend_for_replacement not in ("parallel", "exa", "tavily")
+            and results  # 有可评判的结果
+            and all(
+                (r.get("error") and not r.get("content"))
+                for r in results
+            )
+        ):
+            tried: set = {r.get("url", "") for r in results}
+            tried.update(urls)
+            logger.warning(
+                "[REPLACEMENT] 所有输入 URL 均失败 (%d个)，按 query 拉取候选 query=%r",
+                len(results), query,
+            )
+            _log_fallback_event(
+                "REPLACEMENT_START",
+                f"query={query} failed_input_urls={len(results)}",
+            )
+
+            # 注意：必须保持纯 async，避免在 running loop 内部调用同步 web_search_tool
+            # 触发 _run_async_safely 的线程池等待，导致整个事件循环阻塞最长
+            # (LOCAL_TIMEOUT + CLOUD_TIMEOUT) 秒。
+            search_limit = max(max_search_retries + 5, 10)
+            candidates: List[Dict[str, Any]] = []
+            try:
+                search_response = None
+                primary_url_env = os.getenv("FIRECRAWL_PRIMARY_URL")
+                if primary_url_env and FIRECRAWL_ENABLE_FALLBACK:
+                    try:
+                        search_response = await _try_search_with_fallback(
+                            query, limit=search_limit
+                        )
+                    except RuntimeError:
+                        # fallback 未启用 → 走默认客户端
+                        search_response = None
+
+                if search_response is None:
+                    try:
+                        search_response = await asyncio.wait_for(
+                            asyncio.to_thread(
+                                _get_firecrawl_client().search,
+                                query=query,
+                                limit=search_limit,
+                            ),
+                            timeout=FIRECRAWL_LOCAL_TIMEOUT,
+                        )
+                    except asyncio.TimeoutError:
+                        logger.error(
+                            "[REPLACEMENT] 默认 firecrawl 搜索超时 query=%r", query,
+                        )
+                        search_response = None
+
+                if search_response is not None:
+                    candidates = _extract_web_search_results(
+                        _normalize_firecrawl_payload(search_response)
+                    )
+                    logger.info(
+                        "[REPLACEMENT] web_search 返回 %d 个候选", len(candidates),
+                    )
+                    logger.debug(
+                        "[REPLACEMENT] 候选 (top10): %s",
+                        [c.get("url") for c in candidates[:10]],
+                    )
+            except Exception as search_err:
+                logger.error(
+                    "[REPLACEMENT] 换源搜索调用失败：%s",
+                    str(search_err)[:200],
+                )
+                _log_fallback_event(
+                    "REPLACEMENT_EXHAUSTED",
+                    f"query={query} reason=web_search_failed err={str(search_err)[:200]}",
+                )
+                candidates = []
+
+            attempts_made = 0
+            for cand in candidates:
+                if attempts_made >= max_search_retries:
+                    break
+                cand_url = (cand or {}).get("url", "").strip()
+                if not cand_url or cand_url in tried:
+                    continue
+                if not is_safe_url(cand_url):
+                    logger.info("[REPLACEMENT] 跳过不安全 url=%s", cand_url)
+                    tried.add(cand_url)
+                    continue
+
+                attempts_made += 1
+                debug_call_data["replacement_urls_tried"].append(cand_url)
+                logger.info(
+                    "[REPLACEMENT] attempt=%d/%d url=%s",
+                    attempts_made, max_search_retries, cand_url,
+                )
+                _log_fallback_event(
+                    "REPLACEMENT_TRY",
+                    f"attempt={attempts_made}/{max_search_retries} url={cand_url}",
+                )
+                tried.add(cand_url)
+
+                replacement_result = await _scrape_one_firecrawl(cand_url)
+                results.append(replacement_result)
+
+                if (
+                    replacement_result.get("content")
+                    and not replacement_result.get("error")
+                ):
+                    debug_call_data["replacement_succeeded"] = True
+                    replacement_used = True
+                    logger.info(
+                        "[REPLACEMENT] ✅ 换源成功 url=%s attempts=%d",
+                        cand_url, attempts_made,
+                    )
+                    _log_fallback_event(
+                        "REPLACEMENT_SUCCESS",
+                        f"url={cand_url} attempts={attempts_made}",
+                    )
+                    break
+
+            debug_call_data["replacement_attempts"] = attempts_made
+            if not replacement_used and attempts_made > 0:
+                logger.error(
+                    "[REPLACEMENT] 换源耗尽 %d 次仍全失败", attempts_made,
+                )
+                _log_fallback_event(
+                    "REPLACEMENT_EXHAUSTED",
+                    f"query={query} attempts={attempts_made}",
+                )
+
         response = {"results": results}
-        
+
         pages_extracted = len(response.get('results', []))
-        logger.info("Extracted content from %d pages", pages_extracted)
+        logger.info("[WEB_EXTRACT] 抽取完成 pages=%d replacement_attempts=%d replacement_succeeded=%s",
+                    pages_extracted,
+                    debug_call_data["replacement_attempts"],
+                    debug_call_data["replacement_succeeded"])
         
         debug_call_data["pages_extracted"] = pages_extracted
         debug_call_data["original_response_size"] = len(json.dumps(response))
@@ -1782,16 +2113,27 @@ async def web_extract_tool(
             }
             for r in response.get("results", [])
         ]
-        trimmed_response = {"results": trimmed_results}
+        trimmed_response: Dict[str, Any] = {"results": trimmed_results}
 
-        if trimmed_response.get("results") == []:
+        # B9 fix: 全部失败时保留 per-URL error，添加 all_failed 标记，不再丢掉详情。
+        if not trimmed_results:
             result_json = tool_error("Content was inaccessible or not found")
-
             cleaned_result = clean_base64_images(result_json)
-        
+        elif all((r.get("error") and not r.get("content")) for r in trimmed_results):
+            trimmed_response["all_failed"] = True
+            trimmed_response["errors"] = [
+                {"url": r.get("url", ""), "error": r.get("error")}
+                for r in trimmed_results
+            ]
+            trimmed_response["replacement_attempts"] = debug_call_data["replacement_attempts"]
+            logger.warning(
+                "[WEB_EXTRACT] 所有 URL 抽取均失败，replacement_attempts=%d，返回结构化错误交由上游处理",
+                debug_call_data["replacement_attempts"],
+            )
+            result_json = json.dumps(trimmed_response, indent=2, ensure_ascii=False)
+            cleaned_result = clean_base64_images(result_json)
         else:
             result_json = json.dumps(trimmed_response, indent=2, ensure_ascii=False)
-            
             cleaned_result = clean_base64_images(result_json)
         
         debug_call_data["final_response_size"] = len(cleaned_result)
@@ -1805,12 +2147,12 @@ async def web_extract_tool(
             
     except Exception as e:
         error_msg = f"Error extracting content: {str(e)}"
-        logger.debug("%s", error_msg)
-        
+        logger.error("[WEB_EXTRACT] %s", error_msg)
+
         debug_call_data["error"] = error_msg
         _debug.log_call("web_extract_tool", debug_call_data)
         _debug.save()
-        
+
         return tool_error(error_msg)
 
 
@@ -2006,7 +2348,7 @@ async def web_crawl_tool(
                 **crawl_params
             )
         except Exception as e:
-            logger.debug("Crawl API call failed: %s", e)
+            logger.error("[WEB_CRAWL] Crawl API call failed: %s", e)
             raise
 
         pages: List[Dict[str, Any]] = []
@@ -2218,12 +2560,12 @@ async def web_crawl_tool(
         
     except Exception as e:
         error_msg = f"Error crawling website: {str(e)}"
-        logger.debug("%s", error_msg)
-        
+        logger.error("[WEB_CRAWL] %s", error_msg)
+
         debug_call_data["error"] = error_msg
         _debug.log_call("web_crawl_tool", debug_call_data)
         _debug.save()
-        
+
         return tool_error(error_msg)
 
 
@@ -2386,7 +2728,7 @@ WEB_SEARCH_SCHEMA = {
 
 WEB_EXTRACT_SCHEMA = {
     "name": "web_extract",
-    "description": "Extract content from web page URLs. Returns page content in markdown format. Also works with PDF URLs (arxiv papers, documents, etc.) — pass the PDF link directly and it converts to markdown text. Pages under 5000 chars return full markdown; larger pages are LLM-summarized and capped at ~5000 chars per page. Pages over 2M chars are refused. If a URL fails or times out, use the browser tool to access it instead.",
+    "description": "Extract content from web page URLs. Returns page content in markdown format. Also works with PDF URLs (arxiv papers, documents, etc.) — pass the PDF link directly and it converts to markdown text. Pages under 5000 chars return full markdown; larger pages are LLM-summarized and capped at ~5000 chars per page. Pages over 2M chars are refused. If all URLs fail and a `query` is supplied, the tool will internally call web_search to fetch up to 5 alternative candidate URLs and retry, returning the first successful one (or a structured all_failed payload if every retry also fails).",
     "parameters": {
         "type": "object",
         "properties": {
@@ -2395,7 +2737,11 @@ WEB_EXTRACT_SCHEMA = {
                 "items": {"type": "string"},
                 "description": "List of URLs to extract content from (max 5 URLs per call)",
                 "maxItems": 5
-            }
+            },
+            "query": {
+                "type": "string",
+                "description": "Optional original search query. When all input URLs fail, the tool will use this query to fetch alternative candidate URLs via web_search and retry up to 5 times before giving up.",
+            },
         },
         "required": ["urls"]
     }
@@ -2416,7 +2762,10 @@ registry.register(
     toolset="web",
     schema=WEB_EXTRACT_SCHEMA,
     handler=lambda args, **kw: web_extract_tool(
-        args.get("urls", [])[:5] if isinstance(args.get("urls"), list) else [], "markdown"),
+        args.get("urls", [])[:5] if isinstance(args.get("urls"), list) else [],
+        "markdown",
+        query=args.get("query"),
+    ),
     check_fn=check_web_api_key,
     requires_env=_web_requires_env(),
     is_async=True,

@@ -1,0 +1,12 @@
+[2026-04-26 15:20:35] [PRIMARY_FAIL] scrape:https://artificialanalysis.ai/models/open-source reason=timeout 30.03s
+[2026-04-26 15:20:35] [FALLBACK_TRIGGERED] scrape:https://artificialanalysis.ai/models/open-source reason=timeout
+[2026-04-26 15:20:36] [CLOUD_SUCCESS] scrape:https://artificialanalysis.ai/models/open-source via=timeout_fallback
+[2026-04-26 15:42:25] [PRIMARY_FAIL] scrape:https://artificialanalysis.ai/models/open-source reason=timeout 30.03s
+[2026-04-26 15:42:25] [FALLBACK_TRIGGERED] scrape:https://artificialanalysis.ai/models/open-source reason=timeout
+[2026-04-26 15:42:27] [CLOUD_SUCCESS] scrape:https://artificialanalysis.ai/models/open-source via=timeout_fallback
+[2026-04-26 15:42:57] [PRIMARY_FAIL] scrape:https://lmarena.ai/leaderboard reason=timeout 30.03s
+[2026-04-26 15:42:57] [FALLBACK_TRIGGERED] scrape:https://lmarena.ai/leaderboard reason=timeout
+[2026-04-26 15:42:59] [CLOUD_SUCCESS] scrape:https://lmarena.ai/leaderboard via=timeout_fallback
+[2026-04-26 15:44:23] [PRIMARY_FAIL] search:HuggingFace Open LLM Leaderboard top 20 models 2025 2026 reason=timeout 30.03s
+[2026-04-26 15:44:23] [FALLBACK_TRIGGERED] search:HuggingFace Open LLM Leaderboard top 20 models 2025 2026 reason=timeout
+[2026-04-26 15:44:24] [CLOUD_SUCCESS] search:HuggingFace Open LLM Leaderboard top 20 models 2025 2026 via=timeout_fallback
